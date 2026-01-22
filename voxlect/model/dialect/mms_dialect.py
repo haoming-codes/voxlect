@@ -127,65 +127,92 @@ class Wav2Vec2EncoderLayerStableLayerNorm(nn.Module):
 
         return outputs
 
+from typing import Any, Dict, Optional
+
 class MMSWrapper(
     nn.Module,
-    PyTorchModelHubMixin, 
-    repo_url="https://github.com/tiantiaf0627/voxlect"
+    PyTorchModelHubMixin,
+    # repo_url="https://github.com/tiantiaf0627/voxlect",
 ):
+    """
+    Wrapper that (a) can be loaded from HF Hub via PyTorchModelHubMixin and
+    (b) internally loads a Transformers backbone + feature extractor.
+
+    Key fix: make sure HF hub kwargs (cache_dir, token, revision, local_files_only, etc.)
+    get forwarded to the internal Transformers .from_pretrained() calls.
+    """
+
     def __init__(
         self,
-        pretrain_model="mms-lid-256", 
-        hidden_dim=256,
-        finetune_method="lora",
-        lora_rank=16,
-        freeze_params=True,
-        output_class_num=4,
-        use_conv_output=True
+        pretrain_model: str = "mms-lid-256",
+        hidden_dim: int = 256,
+        finetune_method: str = "lora",
+        lora_rank: int = 16,
+        freeze_params: bool = True,
+        output_class_num: int = 4,
+        use_conv_output: bool = True,
+        backbone_from_pretrained_kwargs: Optional[Dict[str, Any]] = None,
+        **_ignored: Any,  # swallow any extra kwargs safely
     ):
-        super(MMSWrapper, self).__init__()
-        # 1. We Load the model first with weights
+        super().__init__()
+
+        # These kwargs will be forwarded to BOTH AutoFeatureExtractor and Wav2Vec2Model downloads.
+        hf_kwargs: Dict[str, Any] = dict(backbone_from_pretrained_kwargs or {})
+        # Avoid accidental conflicts / duplicates.
+        hf_kwargs.pop("output_hidden_states", None)
+
+        # 1) Load backbone + processor with forwarded kwargs
         if pretrain_model == "mms-lid-256":
             model_id = "facebook/mms-lid-256"
-            self.processor = AutoFeatureExtractor.from_pretrained(model_id)
-            self.backbone_model = Wav2Vec2Model.from_pretrained(
-                model_id, output_hidden_states=True
-            )
         elif pretrain_model == "mms-300m":
             model_id = "facebook/mms-300m"
-            self.processor = AutoFeatureExtractor.from_pretrained(model_id)
-            self.backbone_model = Wav2Vec2Model.from_pretrained(
-                model_id, output_hidden_states=True
-            )
-        
-        self.pretrain_model             = pretrain_model
-        self.finetune_method            = finetune_method
-        self.use_conv_output            = use_conv_output
-        
-        state_dict = self.backbone_model.state_dict()
-        # 2. Read the model config
-        self.model_config = self.backbone_model.config
-        self.model_config.finetune_method        = finetune_method
-        self.model_config.lora_rank              = lora_rank
-        
-        # 3. Config encoder layers with adapter or embedding prompt
-        self.backbone_model.encoder.layers = nn.ModuleList(
-            [Wav2Vec2EncoderLayerStableLayerNorm(i, self.model_config, has_relative_position_bias=(i == 0)) for i in range(self.model_config.num_hidden_layers)]
+        else:
+            raise ValueError(f"Unknown pretrain_model={pretrain_model!r}")
+
+        self.processor = AutoFeatureExtractor.from_pretrained(model_id, **hf_kwargs)
+        self.backbone_model = Wav2Vec2Model.from_pretrained(
+            model_id,
+            output_hidden_states=True,
+            **hf_kwargs,
         )
-        # 4. Load the weights back
+
+        self.pretrain_model = pretrain_model
+        self.finetune_method = finetune_method
+        self.use_conv_output = use_conv_output
+
+        state_dict = self.backbone_model.state_dict()
+
+        # 2) Read + extend config
+        self.model_config = self.backbone_model.config
+        self.model_config.finetune_method = finetune_method
+        self.model_config.lora_rank = lora_rank
+
+        # 3) Swap encoder layers
+        self.backbone_model.encoder.layers = nn.ModuleList(
+            [
+                Wav2Vec2EncoderLayerStableLayerNorm(
+                    i, self.model_config, has_relative_position_bias=(i == 0)
+                )
+                for i in range(self.model_config.num_hidden_layers)
+            ]
+        )
+
+        # 4) Reload weights
         msg = self.backbone_model.load_state_dict(state_dict, strict=False)
 
-        # 5. Freeze the weights
+        # 5) Freeze weights
         self.freeze_params = freeze_params
         if self.freeze_params and self.finetune_method != "lora":
-            for _, p in self.backbone_model.named_parameters(): p.requires_grad = False
+            for _, p in self.backbone_model.named_parameters():
+                p.requires_grad = False
         elif self.freeze_params and self.finetune_method == "lora":
             for name, p in self.backbone_model.named_parameters():
-                if name in msg.missing_keys: p.requires_grad = True
-                else: p.requires_grad = False
+                p.requires_grad = name in msg.missing_keys
         else:
-            for _, p in self.backbone_model.named_parameters(): p.requires_grad = True
+            for _, p in self.backbone_model.named_parameters():
+                p.requires_grad = True
 
-        # 6. Downstream models
+        # 6) Downstream
         self.model_seq = nn.Sequential(
             nn.Conv1d(self.model_config.hidden_size, hidden_dim, 1, padding=0),
             nn.ReLU(),
@@ -193,22 +220,74 @@ class MMSWrapper(
             nn.Conv1d(hidden_dim, hidden_dim, 1, padding=0),
             nn.ReLU(),
             nn.Dropout(p=0.1),
-            nn.Conv1d(hidden_dim, hidden_dim, 1, padding=0)
+            nn.Conv1d(hidden_dim, hidden_dim, 1, padding=0),
         )
 
         if self.use_conv_output:
-            num_layers = self.model_config.num_hidden_layers + 1  # transformer layers + input embeddings
-            self.weights = nn.Parameter(torch.ones(num_layers)/num_layers)
+            num_layers = self.model_config.num_hidden_layers + 1
+            self.weights = nn.Parameter(torch.ones(num_layers) / num_layers)
         else:
             num_layers = self.model_config.num_hidden_layers
             self.weights = nn.Parameter(torch.zeros(num_layers))
-        
+
         self.out_layer = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, output_class_num),
         )
-        
+
+    @classmethod
+    def _from_pretrained(
+        cls,
+        model_id: str,
+        revision: Optional[str] = None,
+        cache_dir: Optional[str] = None,
+        force_download: bool = False,
+        proxies: Optional[Dict[str, str]] = None,
+        resume_download: bool = False,
+        local_files_only: bool = False,
+        token: Optional[str] = None,
+        map_location: str = "cpu",
+        strict: bool = True,
+        **model_kwargs: Any,
+    ):
+        """
+        Bridge HF hub kwargs (cache_dir/token/revision/...) into the constructor so the
+        internal Transformers downloads use the same cache.
+        """
+        hub_kwargs: Dict[str, Any] = {
+            "cache_dir": cache_dir,
+            "revision": revision,
+            "force_download": force_download,
+            "proxies": proxies,
+            "resume_download": resume_download,
+            "local_files_only": local_files_only,
+            "token": token,
+        }
+        # Keep False/None out except local_files_only which is meaningful either way.
+        hub_kwargs = {k: v for k, v in hub_kwargs.items() if v is not None}
+        if local_files_only:
+            hub_kwargs["local_files_only"] = True
+
+        existing = dict(model_kwargs.get("backbone_from_pretrained_kwargs") or {})
+        # User-provided backbone kwargs win over injected hub kwargs if they collide
+        merged = {**hub_kwargs, **existing}
+        model_kwargs["backbone_from_pretrained_kwargs"] = merged
+
+        return super()._from_pretrained(
+            model_id=model_id,
+            revision=revision,
+            cache_dir=cache_dir,
+            force_download=force_download,
+            proxies=proxies,
+            resume_download=resume_download,
+            local_files_only=local_files_only,
+            token=token,
+            map_location=map_location,
+            strict=strict,
+            **model_kwargs,
+        )
+
     def forward(self, x, length=None, return_feature=False):
         #=========================== Speech Modeling ============================#
         with torch.no_grad():
